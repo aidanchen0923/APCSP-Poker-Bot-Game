@@ -5,7 +5,7 @@ two-level MC: inner equity (exact, real decision only) + outer match rollout (P(
 all in-match input is keystroke-min + validated; state derived, never re-typed.
 """
 
-import os, sys, time, pickle, random, itertools
+import os, sys, time, pickle, random, itertools, copy
 from treys import Card, Evaluator
 
 EVAL = Evaluator()
@@ -92,10 +92,9 @@ def equity(hole, board, n_opp, tightness=0.0, iters=20000):
 # ============================================================
 # OPPONENT MODEL  - per seat behavioral fit, Bayesian shrinkage
 # ============================================================
-# population priors (placeholders until tuned on the test corpus). counts of a
-# "virtual" sample so real data overrides quickly. NOT final magic numbers - the
-# whole point of the corpus is to fit these.
-PRIOR = dict(aggr=0.30, fold=0.55, bluff=0.15, strength=20.0)  # strength=prior weight
+# population priors MEASURED from the archetype zoo via sim.measure_priors (not guesses).
+# re-run sim.py to refit if the zoo changes. strength = virtual-sample weight.
+PRIOR = dict(aggr=0.237, fold=0.324, bluff=0.056, strength=20.0)  # measured 2026, n~14k actions
 class Seat:
     def __init__(self):
         self.aggr_n = self.aggr_k = 0      # aggressive acts / total acts
@@ -181,6 +180,7 @@ class Hand:
         self.last_raiser = bbs                  # BB closes preflop action
         self.high = self.bb                     # current bet level this street
         self.min_raise = self.bb                # min legal raise increment
+        self.acted = set()                      # seats that have acted at current bet level
     def _count_live(self): return sum(1 for s in range(self.n) if self.live[s] and not self.folded[s])
     def to_call(self, seat): return max(0, self.high - self.street_commit[seat])
     def legal(self, seat):
@@ -198,6 +198,7 @@ class Hand:
     def apply(self, kind, amt):
         """apply action for self.cur. amt = target TOTAL street commit (for bet/raise/call). validated upstream."""
         seat = self.cur; faced = self.to_call(seat) > 0
+        raised = False
         if kind == 'fold':
             self.folded[seat] = True
         elif kind == 'check':
@@ -213,25 +214,26 @@ class Hand:
                 self.min_raise = max(self.min_raise, inc)
                 self.high = target
                 self.last_raiser = seat
+                raised = True
         self.hist.append([self.street, seat, kind, amt if kind in ('bet','raise','call') else -1])
-        # mark seat as having acted; advance
+        # a bet/raise reopens action: only the raiser has "acted" at the new level
+        if raised: self.acted = {seat}
+        else: self.acted.add(seat)
         self._advance(seat)
-    def _advance(self, seat):
-        # street ends when action returns to last_raiser, or all matched/folded/allin
-        nxt = self._next_live(seat)
+    def _street_end(self):
+        # ends when every active (live,not-folded,not-allin) seat has acted AND matched high
         active = [s for s in range(self.n) if self.live[s] and not self.folded[s] and not self.allin[s]]
+        if not active: return True
+        for s in active:
+            if s not in self.acted or self.street_commit[s] != self.high:
+                return False
+        return True
+    def _advance(self, seat):
         if self._count_live() <= 1:
             self.cur = None; self.over = True; return
-        if not active:
+        if self._street_end():
             self.cur = None; self._street_done = True; return
-        # everyone matched high and we've come back around to closer?
-        if nxt == self.last_raiser and all(self.street_commit[s] == self.high or self.allin[s] or self.folded[s] or not self.live[s] for s in range(self.n)):
-            self.cur = None; self._street_done = True
-        elif all(self.street_commit[s] == self.high or self.allin[s] or self.folded[s] or not self.live[s] for s in range(self.n)) and self.high == 0:
-            # checked around
-            self.cur = None; self._street_done = True
-        else:
-            self.cur = nxt
+        self.cur = self._next_live(seat)        # next active seat still owing an action
     over = False
     _street_done = False
     def next_street(self, cards):
@@ -239,6 +241,7 @@ class Hand:
         self.street_commit = [0]*self.n
         self.high = 0; self.min_raise = self.bb
         self._street_done = False
+        self.acted = set()
         # postflop first to act = first live left of button
         c = self._next_live(self.button)
         self.cur = c; self.last_raiser = c
@@ -255,13 +258,46 @@ def _seat_strength(hole, board):
     # quick made-hand proxy: normalized treys rank (1 best..7462 worst) -> 0..1
     r = EVAL.evaluate(board, list(hole))
     return 1.0 - (r / 7462.0)
+def _resolve_current(st, my_seat, ctx, rng):
+    """resolve THIS hand given my action. mutates st (carried stacks), returns nothing.
+    bet size matters: bigger my_added -> opps fold more (good when eq low = fold equity,
+    bad/var when called). approx: my showdown win prob = ctx['eq']. chips conserved."""
+    pot = ctx['pot']; my_added = ctx['my_added']
+    if ctx['my_fold']:
+        # I'm out, pot goes to a random live opp (raises a rival - bad for me)
+        opps = [o[0] for o in ctx['opps']]
+        if opps: st[rng.choice(opps)] += pot
+        return
+    st[my_seat] -= my_added; pot += my_added
+    callers = []
+    bet_to_pot = my_added / max(pot - my_added, 1)
+    for (oi, ocommit, oseat) in ctx['opps']:
+        if my_added <= 0:                         # I checked/called, no pressure
+            callers.append(oi); continue
+        p_fold = min(0.95, max(0.0, oseat.fold_to_bet() * (0.5 + bet_to_pot)))
+        if rng.random() < p_fold:
+            continue                              # opp folds
+        call_amt = min(my_added, st[oi]); st[oi] -= call_amt; pot += call_amt
+        callers.append(oi)
+    if not callers:
+        st[my_seat] += pot; return                # uncontested, I take it
+    # showdown: I win with prob eq, else a caller takes it
+    if rng.random() < ctx['eq']:
+        st[my_seat] += pot
+    else:
+        st[rng.choice(callers)] += pot
+
 def rollout_p1st(my_seat, stacks, button, blinds_sched, hands_left, seats, n,
-                 my_forced_action=None, n_sims=600):
+                 my_forced_action=None, n_sims=600, ctx=None, rng=random):
     sb0, bb0, ante0, esc = blinds_sched
     wins = 0
     for _ in range(n_sims):
         st = list(stacks); btn = button
-        for h in range(max(1, hands_left)):
+        if ctx is not None:                       # resolve the live hand FIRST
+            _resolve_current(st, my_seat, ctx, rng)
+            btn = _adv_btn(btn, st, n)
+        future = max(0, hands_left - (1 if ctx is not None else 0))
+        for h in range(max(1, future) if future > 0 else 0):
             live = [st[i] > 0 for i in range(n)]
             if sum(live) <= 1: break
             lvl = h  # blind escalation index
@@ -367,7 +403,7 @@ def ask_card(prompt, used):
 # ============================================================
 # DECIDER  - one decision: equity -> P(1st) per action -> argmax
 # ============================================================
-def decide(hand, my_seat, seats, clock, blinds_sched):
+def decide(hand, my_seat, seats, clock, blinds_sched, eq_iters=18000, base_sims=700, last_sims=1200):
     n = hand.n
     hole = MY_HOLE; board = hand.board
     n_opp = sum(1 for s in range(n) if hand.live[s] and not hand.folded[s] and s != my_seat)
@@ -379,7 +415,7 @@ def decide(hand, my_seat, seats, clock, blinds_sched):
             cf = hand.hand_commit[s] / potref
             ts.append(tightness_for(seats[s], cf))
     tight = sum(ts)/len(ts) if ts else 0.0
-    eq = equity(hole, board, max(1, n_opp), tightness=tight, iters=18000)
+    eq = equity(hole, board, max(1, n_opp), tightness=tight, iters=eq_iters)
     # candidate actions from legal set
     legal = hand.legal(my_seat)
     stacks = hand.stacks[:]
@@ -398,21 +434,26 @@ def decide(hand, my_seat, seats, clock, blinds_sched):
             else: amt = int(min(hi, max(lo, base + hand.to_call(my_seat) + frac*hand.pot)))
             amt = max(lo, min(hi, amt))
             cands.append((key, amt))
-    # evaluate each by simulating rest of match. map action -> rough push/fold proxy for sim seed.
+    # live-opp context for current-hand resolution in the rollout
+    opps = [(s, hand.hand_commit[s], seats[s]) for s in range(n)
+            if hand.live[s] and not hand.folded[s] and s != my_seat]
     hands_left = clock.hands_left()
     results = []
     for (kind, amt) in cands:
-        forced = 'fold' if kind == 'fold' else 'play'
-        # bias sims by our equity: if we'd be all-in-ish, real cards in rollout handle it.
-        # adjust THIS hand's chips to reflect the action's immediate commit for the rollout start.
-        sim_stacks = stacks[:]
-        p1 = rollout_p1st(my_seat, sim_stacks, hand.button, blinds_sched, hands_left,
-                          seats, n, my_forced_action=forced,
-                          n_sims=900 if clock.is_last() else 500)
-        # weight by our actual equity for contested lines (rollout policy is coarse)
+        # my_added = chips this action puts in NOW (changes per raise size -> sizing matters)
+        if kind == 'fold':
+            my_added = 0; my_fold = True
+        elif kind == 'check':
+            my_added = 0; my_fold = False
+        elif kind == 'call':
+            my_added = hand.to_call(my_seat); my_fold = False
+        else:  # bet/raise to total street commit `amt`
+            my_added = amt - hand.street_commit[my_seat]; my_fold = False
+        ctx = dict(pot=hand.pot, my_added=my_added, my_fold=my_fold, eq=eq, opps=opps)
+        p1 = rollout_p1st(my_seat, stacks[:], hand.button, blinds_sched, hands_left,
+                          seats, n, n_sims=last_sims if clock.is_last() else base_sims, ctx=ctx)
         results.append((kind, amt, p1, eq))
-    # pick max P(1st); tiebreak prefers our equity-aligned line
-    best = max(results, key=lambda r: (round(r[2], 3), r[3] if r[0] != 'fold' else 0))
+    best = max(results, key=lambda r: (round(r[2], 4), r[3] if r[0] != 'fold' else 0))
     return best, eq, results
 
 # ============================================================
@@ -482,6 +523,9 @@ def main():
 
         # ---- STAGES 3-6: betting streets ----
         street_cards = {1: 3, 2: 1, 3: 1}   # flop/turn/river card counts
+        snaps = []   # stack of (hand, seats, used) deepcopies for reversible undo
+        def snap():
+            snaps.append((copy.deepcopy(hand), copy.deepcopy(seats), set(used)))
         while not hand.over:
             # narrate actions until street done
             while hand.cur is not None:
@@ -495,17 +539,23 @@ def main():
                         print(f'  >>> ACTION: {kind.upper()} to {amt} total  (P1st {best[2]*100:.1f}%)')
                     else:
                         print(f'  >>> ACTION: {kind.upper()}  (P1st {best[2]*100:.1f}%)')
-                    # apply our own move (we did it physically too)
-                    hand.apply(kind, amt)
+                    input('    (press enter once done physically / u then enter to undo last): ') 
+                    # allow undo even on our own move
+                    # NOTE: handled below uniformly; here we just commit
+                    snap(); hand.apply(kind, amt)
                 else:
                     legal = hand.legal(seat)
                     tc = hand.to_call(seat)
                     print(f'\n  seat{seat+1} to act (to-call {tc}, pot {hand.pot}).')
-                    print(f'    legal: {list(legal.keys())}   (u=undo last)')
+                    print(f'    legal: {list(legal.keys())}   (u=undo last action)')
                     a = input('    action [fold/check/call/bet/raise]: ').strip().lower()
                     if a == 'u':
-                        if hand.hist:
-                            print('  (undo not fully reversible in v1 - re-enter hand if state corrupt)')
+                        if snaps:
+                            h2, s2, u2 = snaps.pop()
+                            hand = h2; seats[:] = s2; used.clear(); used.update(u2)
+                            print('    <- undone. re-enter from here.')
+                        else:
+                            print('    ! nothing to undo')
                         continue
                     if a not in legal:
                         print('  ! illegal here'); continue
@@ -514,11 +564,9 @@ def main():
                         lo, hi = legal[a]
                         if not (lo <= amt <= hi):
                             print(f'  ! must be {lo}..{hi}'); continue
-                        # record this seat's aggression vs faced bet
-                        seats[seat].obs_action(a, tc > 0)
-                        hand.apply(a, amt)
+                        snap(); seats[seat].obs_action(a, tc > 0); hand.apply(a, amt)
                     else:
-                        seats[seat].obs_action(a, tc > 0)
+                        snap(); seats[seat].obs_action(a, tc > 0)
                         hand.apply(a, 0 if a != 'call' else legal['call'][0])
                 if getattr(hand, '_count_live', lambda:2)() <= 1:
                     hand.over = True; break
@@ -528,10 +576,18 @@ def main():
             # deal next street
             ncards = street_cards[hand.street + 1]
             cards = []
+            ok = True
             for _ in range(ncards):
                 c = ask_card(f'  board card ({["","flop","turn","river"][hand.street+1]}): ', used)
+                if c == '__UNDO__':
+                    if snaps:
+                        h2, s2, u2 = snaps.pop()
+                        hand = h2; seats[:] = s2; used.clear(); used.update(u2)
+                        print('    <- undone.')
+                    ok = False; break
                 used.add(c); cards.append(c)
-            hand.next_street(cards)
+            if not ok: continue
+            snap(); hand.next_street(cards)
             if hand.over: break
 
         # ---- STAGE 7: SHOWDOWN (optional, feeds bluff model) ----
