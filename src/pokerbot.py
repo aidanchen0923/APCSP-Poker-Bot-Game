@@ -168,8 +168,15 @@ class Hand:
         self.pot += amt
         if self.stacks[seat] == 0: self.allin[seat] = True
     def _post_blinds(self):
+        # post antes directly to pot/hand_commit but NOT street_commit
+        # (antes are dead money and should not affect the street-close check)
         for s in range(self.n):
-            if self.live[s] and self.ante > 0: self._commit(s, self.ante)
+            if self.live[s] and self.ante > 0:
+                amt = min(self.ante, self.stacks[s])
+                self.stacks[s] -= amt
+                self.hand_commit[s] += amt
+                self.pot += amt
+                if self.stacks[s] == 0: self.allin[s] = True
         sbs = self._next_in_hand(self.button) if self._count_live() > 2 else self.button
         bbs = self._next_in_hand(sbs)
         self._commit(sbs, self.sb); self._commit(bbs, self.bb)
@@ -403,6 +410,31 @@ def ask_card(prompt, used):
 # ============================================================
 # DECIDER  - one decision: equity -> P(1st) per action -> argmax
 # ============================================================
+def _fold_equity(opps, my_added, pot):
+    """Expected fraction of pot we steal via fold pressure (0..1)."""
+    if my_added <= 0 or not opps: return 0.0
+    bet_to_pot = my_added / max(pot, 1)
+    # prob ALL opponents fold
+    p_all_fold = 1.0
+    for (_, _, oseat) in opps:
+        p_fold = min(0.95, max(0.0, oseat.fold_to_bet() * (0.5 + bet_to_pot)))
+        p_all_fold *= p_fold
+    return p_all_fold
+
+def _hand_category(eq, board):
+    """Return a string category based on equity and street."""
+    is_pre = len(board) == 0
+    if is_pre:
+        if eq >= 0.65: return 'strong'       # top ~15% of hands
+        if eq >= 0.50: return 'medium'
+        if eq >= 0.38: return 'speculative'
+        return 'weak'
+    else:
+        if eq >= 0.70: return 'strong'
+        if eq >= 0.50: return 'medium'
+        if eq >= 0.33: return 'speculative'
+        return 'weak'
+
 def decide(hand, my_seat, seats, clock, blinds_sched, eq_iters=18000, base_sims=700, last_sims=1200):
     n = hand.n
     hole = MY_HOLE; board = hand.board
@@ -416,43 +448,105 @@ def decide(hand, my_seat, seats, clock, blinds_sched, eq_iters=18000, base_sims=
             ts.append(tightness_for(seats[s], cf))
     tight = sum(ts)/len(ts) if ts else 0.0
     eq = equity(hole, board, max(1, n_opp), tightness=tight, iters=eq_iters)
-    # candidate actions from legal set
+
+    # live-opp context for current-hand resolution in the rollout
+    opps = [(s, hand.hand_commit[s], seats[s]) for s in range(n)
+            if hand.live[s] and not hand.folded[s] and s != my_seat]
+
+    # ---- hand strength gating ----
+    cat = _hand_category(eq, board)
+    tc = hand.to_call(my_seat)
+    # pot odds: fraction of new pot we need to win to break even on a call
+    pot_odds = tc / max(hand.pot + tc, 1)
+    # are opponents generally calling stations (low fold_to_bet)?
+    avg_fold = sum(s.fold_to_bet() for (_, _, s) in opps) / max(len(opps), 1) if opps else PRIOR['fold']
+    bluff_viable = avg_fold >= 0.35   # only bluff if opponents fold at least occasionally
+
     legal = hand.legal(my_seat)
     stacks = hand.stacks[:]
-    # build candidate (kind, amt) list
+
+    # ---- build candidate list based on hand strength ----
     cands = []
-    if 'fold' in legal: cands.append(('fold', -1))
-    if 'check' in legal: cands.append(('check', 0))
-    if 'call' in legal: cands.append(('call', legal['call'][0]))
-    # raise sizes: ~half pot, pot, all-in (clamped to legal)
+
+    # FOLD: only seriously consider if pot odds are bad AND hand is weak
+    if 'fold' in legal:
+        if cat in ('weak', 'speculative') and eq < pot_odds * 0.9:
+            cands.append(('fold', -1))
+        elif cat == 'weak' and tc == 0:
+            pass  # never fold to free check
+        elif cat in ('medium', 'strong'):
+            pass  # don't fold decent hands
+        else:
+            cands.append(('fold', -1))  # weak hand facing a bet with bad odds
+
+    # CHECK: always a candidate when available
+    if 'check' in legal:
+        cands.append(('check', 0))
+
+    # CALL: include when pot odds justify it
+    if 'call' in legal:
+        if eq >= pot_odds * 0.85:  # have at least 85% of required equity
+            cands.append(('call', legal['call'][0]))
+        elif cat == 'weak' and not bluff_viable:
+            pass  # weak hand, no fold equity, skip call
+        else:
+            cands.append(('call', legal['call'][0]))
+
+    # BET / RAISE: gate on hand category
     if 'raise' in legal or 'bet' in legal:
         key = 'raise' if 'raise' in legal else 'bet'
         lo, hi = legal[key]
         base = hand.street_commit[my_seat]
-        for frac, name in [(0.5,'r_half'),(1.0,'r_pot'),(None,'shove')]:
-            if frac is None: amt = hi
-            else: amt = int(min(hi, max(lo, base + hand.to_call(my_seat) + frac*hand.pot)))
-            amt = max(lo, min(hi, amt))
-            cands.append((key, amt))
-    # live-opp context for current-hand resolution in the rollout
-    opps = [(s, hand.hand_commit[s], seats[s]) for s in range(n)
-            if hand.live[s] and not hand.folded[s] and s != my_seat]
+
+        if cat == 'strong':
+            # value bet all sizes
+            for frac in [0.5, 1.0, None]:
+                if frac is None: amt = hi
+                else: amt = int(min(hi, max(lo, base + tc + frac * hand.pot)))
+                cands.append((key, max(lo, min(hi, amt))))
+
+        elif cat == 'medium':
+            # bet half/pot for value, skip shove
+            for frac in [0.5, 1.0]:
+                amt = int(min(hi, max(lo, base + tc + frac * hand.pot)))
+                cands.append((key, max(lo, min(hi, amt))))
+
+        elif cat == 'speculative':
+            # semi-bluff: only small/half-pot bet, only if fold equity exists
+            if bluff_viable:
+                amt = int(min(hi, max(lo, base + tc + 0.5 * hand.pot)))
+                cands.append((key, max(lo, min(hi, amt))))
+
+        elif cat == 'weak':
+            # pure bluff: only if opponents fold a lot AND it's a small bet
+            avg_fe = _fold_equity(opps, int(0.5 * hand.pot), hand.pot)
+            if bluff_viable and avg_fe >= 0.40 and tc == 0:
+                amt = int(min(hi, max(lo, base + 0.5 * hand.pot)))
+                cands.append((key, max(lo, min(hi, amt))))
+
+    # fallback: if nothing was added (edge case), allow check or call
+    if not cands:
+        if 'check' in legal: cands.append(('check', 0))
+        elif 'call' in legal: cands.append(('call', legal['call'][0]))
+        elif 'fold' in legal: cands.append(('fold', -1))
+
     hands_left = clock.hands_left()
     results = []
     for (kind, amt) in cands:
-        # my_added = chips this action puts in NOW (changes per raise size -> sizing matters)
         if kind == 'fold':
             my_added = 0; my_fold = True
         elif kind == 'check':
             my_added = 0; my_fold = False
         elif kind == 'call':
             my_added = hand.to_call(my_seat); my_fold = False
-        else:  # bet/raise to total street commit `amt`
+        else:
             my_added = amt - hand.street_commit[my_seat]; my_fold = False
         ctx = dict(pot=hand.pot, my_added=my_added, my_fold=my_fold, eq=eq, opps=opps)
         p1 = rollout_p1st(my_seat, stacks[:], hand.button, blinds_sched, hands_left,
                           seats, n, n_sims=last_sims if clock.is_last() else base_sims, ctx=ctx)
         results.append((kind, amt, p1, eq))
+
+    # tiebreak: prefer check/call over fold, but never over a clearly better EV action
     best = max(results, key=lambda r: (round(r[2], 4), r[3] if r[0] != 'fold' else 0))
     return best, eq, results
 
@@ -534,7 +628,13 @@ def main():
                     best, eq, results = decide(hand, my_seat, seats, clock, blinds_sched)
                     kind, amt = best[0], best[1]
                     pot = hand.pot; tc = hand.to_call(my_seat)
-                    print(f'\n  >>> YOUR MOVE: pot {pot}, to-call {tc}, equity {eq*100:.1f}%')
+                    cat = _hand_category(eq, hand.board)
+                    print(f'\n  >>> YOUR MOVE: pot {pot}, to-call {tc}, equity {eq*100:.1f}% [{cat}]')
+                    # show all evaluated options for transparency
+                    for (k, a, p, _) in sorted(results, key=lambda r: -r[2]):
+                        marker = ' <-- BEST' if (k == kind and a == amt) else ''
+                        label = f'{k.upper()} to {a}' if k in ('bet','raise') else k.upper()
+                        print(f'       {label:20s}  P1st {p*100:.1f}%{marker}')
                     if kind in ('bet','raise'):
                         print(f'  >>> ACTION: {kind.upper()} to {amt} total  (P1st {best[2]*100:.1f}%)')
                     else:
