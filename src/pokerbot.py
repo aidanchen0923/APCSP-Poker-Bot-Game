@@ -118,6 +118,18 @@ class Seat:
     def confidence(self):  # 0..1, how much real data we have on this seat
         n = self.aggr_n + self.face_n + self.sd_n
         return n / (n + PRIOR['strength'])
+    # ---- soft-gated views: blend fit toward CALIBRATED neutral by confidence ----
+    # neutral choices are principled, not arbitrary:
+    # - fold_to_bet neutral = pot-odds break-even fold rate for a pot-sized bluff = 1/3.
+    #   means: with no read, bluffs are exactly EV-zero -> bot reduces to equity play.
+    # - aggression neutral = 0.5 -> future-hand policy collapses to "play strength>=0.5"
+    # confidence=0 -> use neutral (no exploit), confidence=1 -> use fit (full exploit).
+    def fold_to_bet_gated(self):
+        c = self.confidence()
+        return c * self.fold_to_bet() + (1 - c) * (1.0/3.0)
+    def aggression_gated(self):
+        c = self.confidence()
+        return c * self.aggression() + (1 - c) * 0.5
 
 # ---------- range mapper: model + committed chips -> tightness for equity ----------
 def tightness_for(seat, committed_frac):
@@ -258,6 +270,7 @@ def _seat_strength(hole, board):
     # quick made-hand proxy: normalized treys rank (1 best..7462 worst) -> 0..1
     r = EVAL.evaluate(board, list(hole))
     return 1.0 - (r / 7462.0)
+_RESOLVE_TRACE = None   # if a list, _resolve_current appends ('folded_out'|'called_won'|'called_lost', my_added)
 def _resolve_current(st, my_seat, ctx, rng):
     """resolve THIS hand given my action. mutates st (carried stacks), returns nothing.
     bet size matters: bigger my_added -> opps fold more (good when eq low = fold equity,
@@ -274,18 +287,37 @@ def _resolve_current(st, my_seat, ctx, rng):
     for (oi, ocommit, oseat) in ctx['opps']:
         if my_added <= 0:                         # I checked/called, no pressure
             callers.append(oi); continue
-        p_fold = min(0.95, max(0.0, oseat.fold_to_bet() * (0.5 + bet_to_pot)))
+        p_fold = min(0.95, max(0.0, oseat.fold_to_bet_gated() * (0.5 + bet_to_pot)))
         if rng.random() < p_fold:
             continue                              # opp folds
         call_amt = min(my_added, st[oi]); st[oi] -= call_amt; pot += call_amt
         callers.append(oi)
     if not callers:
-        st[my_seat] += pot; return                # uncontested, I take it
-    # showdown: I win with prob eq, else a caller takes it
-    if rng.random() < ctx['eq']:
         st[my_seat] += pot
+        if _RESOLVE_TRACE is not None and my_added > 0: _RESOLVE_TRACE.append(('folded_out', my_added))
+        return                                    # uncontested, I take it
+    # showdown vs CALLERS (not random hands): callers are selected for strength, so our
+    # realized equity is below our raw eq. documented form: the more they had to call
+    # relative to the pot, the narrower (stronger) their range -> larger equity drop.
+    # also: nittier callers => stronger calling range => larger drop. gated => no-read
+    # gives a neutral mid discount, not zero (which was the double-count bug).
+    if my_added > 0:
+        # avg caller nitiness via gated fold-tendency (high fold2bet => when they DO call, strong)
+        nit = sum(o[2].fold_to_bet_gated() for o in ctx['opps'] if o[0] in callers) / max(1,len(callers))
+        # bet pressure: my_added relative to the pot they're calling into
+        pressure = min(1.0, my_added / max(pot - my_added, 1))   # 0..1, ~bet/pot
+        # narrowing: more pressure + nittier => more selection => bigger eq cut.
+        # K is the single scale to calibrate via raise_audit (start 0.6, tune to match reality).
+        K = 0.8   # calibrated: lands called-winrate ~24% (documented conditioned ~25%);
+        narrow = K * pressure * (0.5 + nit)      # 0.5 floor so even loose callers cut some
+        eq_real = ctx['eq'] * max(0.15, 1.0 - narrow)   # never below a small floor
     else:
-        st[rng.choice(callers)] += pot
+        eq_real = ctx['eq']                      # I just called/checked: no selection effect
+    won = rng.random() < eq_real
+    if won: st[my_seat] += pot
+    else: st[rng.choice(callers)] += pot
+    if _RESOLVE_TRACE is not None and my_added > 0:
+        _RESOLVE_TRACE.append(('called_won' if won else 'called_lost', my_added))
 
 def rollout_p1st(my_seat, stacks, button, blinds_sched, hands_left, seats, n,
                  my_forced_action=None, n_sims=600, ctx=None, rng=random):
@@ -316,7 +348,7 @@ def rollout_p1st(my_seat, stacks, button, blinds_sched, hands_left, seats, n,
             for i in order:
                 a = min(ante, st[i]); st[i] -= a; contributions[i] += a
             pot = sum(contributions.values())
-            committed = bb  # call price proxy
+            committed = bb  # base call price proxy
             for i in order:
                 if not in_hand[i]: continue
                 strength = pf_pct(*holes[i])
@@ -325,13 +357,24 @@ def rollout_p1st(my_seat, stacks, button, blinds_sched, hands_left, seats, n,
                 else:
                     seat = seats[i]
                     # threshold: nittier/fold-prone seats need more to continue
-                    thr = 0.35 + 0.4 * seat.fold_to_bet() - 0.25 * seat.aggression()
+                    thr = 0.35 + 0.4 * seat.fold_to_bet_gated() - 0.25 * seat.aggression_gated()
                     thr = min(0.9, max(0.05, thr))
                     act = 'play' if strength >= thr else 'fold'
                 if act == 'fold':
                     in_hand[i] = False
                 else:
-                    put = min(committed, st[i]); st[i] -= put; contributions[i] += put; pot += put
+                    # stack-aware commit: when a player's stack is small relative to bb
+                    # (short stack), the realistic action is push/fold -> they risk a large
+                    # fraction of their stack, creating real bust risk. big stacks risk only
+                    # the base price. this fixes the documented short-stack OVERESTIMATE:
+                    # shortness must be costly or the rollout treats it as nearly free.
+                    bb_ratio = st[i] / max(bb, 1)        # stack in big blinds
+                    if bb_ratio <= 12:                    # short -> shove fraction rises as stack shrinks
+                        shove_frac = min(1.0, (13 - bb_ratio) / 13.0)
+                        put = min(max(committed, shove_frac * st[i]), st[i])
+                    else:
+                        put = min(committed, st[i])
+                    st[i] -= put; contributions[i] += put; pot += put
             contenders = [i for i in in_hand if in_hand[i]]
             if not contenders:
                 btn = _adv_btn(btn, st, n); continue
@@ -373,7 +416,7 @@ class Clock:
     def time_left_min(self): return max(0.0, (self.total - (time.time()-self.t0)) / 60.0)
     def hands_left(self):
         if self.mph <= 0: return 1
-        return max(1, int(self.time_left_min() / self.mph))
+        return max(1, min(15, int(self.time_left_min() / self.mph)))   # cap at 15
     def is_last(self): return self.hands_left() <= 1 or self.time_left_min() <= 0.1
 
 # ============================================================
@@ -400,10 +443,64 @@ def ask_card(prompt, used):
         except Exception as e:
             print('  ! ', e)
 
+def chip_ev(hand, my_seat, eq, ctx_opps):
+    """estimate chip-EV of each candidate action, returned as DELTA-chips vs folding.
+    fold = 0 (baseline). passive = current pot equity. aggressive = fold-equity * pot
+    + call-rate * (eq_conditional * (pot+my_added) - my_added).
+    uses the same conditioned-eq logic as the resolver, so calling ranges are accounted.
+    NO match rollout. NO future-hand simulation. fast, low-variance, signal-rich."""
+    pot = hand.pot
+    out = {}
+    out[('fold', -1)] = 0.0
+    if 'check' in hand.legal(my_seat):
+        out[('check', 0)] = eq * pot
+    legal = hand.legal(my_seat)
+    if 'call' in legal:
+        tc = hand.to_call(my_seat)
+        # call EV = eq*(pot+tc) - (1-eq)*tc - tc_already... simpler: eq*(pot+tc) - tc
+        out[('call', legal['call'][0])] = eq * (pot + tc) - tc
+    # bet/raise: model fold-equity + conditioned showdown like _resolve_current
+    if 'raise' in legal or 'bet' in legal:
+        key = 'raise' if 'raise' in legal else 'bet'
+        lo, hi = legal[key]
+        base = hand.street_commit[my_seat]
+        for frac in [0.5, 1.0, None]:
+            if frac is None: amt = hi
+            else: amt = int(min(hi, max(lo, base + hand.to_call(my_seat) + frac * pot)))
+            amt = max(lo, min(hi, amt))
+            my_added = amt - hand.street_commit[my_seat]
+            if my_added <= 0: continue
+            # per-opp fold prob (mirror resolver, gated stats)
+            bet_to_pot = my_added / max(pot, 1)
+            p_all_fold = 1.0; nits = []
+            for (_, _, oseat) in ctx_opps:
+                pf = min(0.95, max(0.0, oseat.fold_to_bet_gated() * (0.5 + bet_to_pot)))
+                p_all_fold *= pf; nits.append(oseat.fold_to_bet_gated())
+            # conditioned eq when called (same K=0.8 form as resolver)
+            nit = sum(nits)/len(nits) if nits else 0.33
+            pressure = min(1.0, my_added / max(pot, 1))
+            narrow = 0.8 * pressure * (0.5 + nit)
+            eq_called = eq * max(0.15, 1.0 - narrow)
+            # EV = P(all fold) * pot + P(at least one calls) * [eq_called*(pot+my_added+matched) - my_added]
+            # approx matched = my_added per caller; use expected #callers
+            exp_callers = sum(1 - min(0.95, max(0.0, oseat.fold_to_bet_gated() * (0.5 + bet_to_pot)))
+                              for (_, _, oseat) in ctx_opps)
+            matched = my_added * exp_callers
+            ev_called = eq_called * (pot + my_added + matched) - my_added
+            ev = p_all_fold * pot + (1 - p_all_fold) * ev_called
+            out[(key, amt)] = ev
+    return out
+
 # ============================================================
-# DECIDER  - one decision: equity -> P(1st) per action -> argmax
+# DECIDER  - regime-switched: chip-EV mid-game, P(1st) endgame
 # ============================================================
-def decide(hand, my_seat, seats, clock, blinds_sched, eq_iters=18000, base_sims=700, last_sims=1200):
+# DECISION 0 (pre-registered A/B): chip-EV mid-game when hands_left > K, else P(1st).
+# theory: winner-take-all mid-game = chip-EV per literature; P(1st) only when deadline
+# is close enough that being-top-at-buzzer diverges from accumulating chips.
+REGIME_K = 2          # endgame = last K hands.
+USE_REGIME = False    # A/B at N=200 was null (diff +0.030 CI [-0.038,+0.098]); old behavior is default.
+
+def decide(hand, my_seat, seats, clock, blinds_sched, eq_iters=2000, base_sims=150, last_sims=300):
     n = hand.n
     hole = MY_HOLE; board = hand.board
     n_opp = sum(1 for s in range(n) if hand.live[s] and not hand.folded[s] and s != my_seat)
@@ -429,15 +526,37 @@ def decide(hand, my_seat, seats, clock, blinds_sched, eq_iters=18000, base_sims=
         key = 'raise' if 'raise' in legal else 'bet'
         lo, hi = legal[key]
         base = hand.street_commit[my_seat]
+        # confidence in opp reads - if zero (hand 1 typically), be more conservative
+        avg_conf = sum(seats[s].confidence() for s in range(n) if hand.live[s] and not hand.folded[s] and s != my_seat)
+        avg_conf = avg_conf / max(1, n_opp)
         for frac, name in [(0.5,'r_half'),(1.0,'r_pot'),(None,'shove')]:
-            if frac is None: amt = hi
+            if frac is None:
+                # only allow shove if eq is strong OR we have read confidence
+                if eq < 0.65 and avg_conf < 0.3: continue
+                amt = hi
             else: amt = int(min(hi, max(lo, base + hand.to_call(my_seat) + frac*hand.pot)))
             amt = max(lo, min(hi, amt))
             cands.append((key, amt))
-    # live-opp context for current-hand resolution in the rollout
+    # live-opp context (used by both regimes)
     opps = [(s, hand.hand_commit[s], seats[s]) for s in range(n)
             if hand.live[s] and not hand.folded[s] and s != my_seat]
     hands_left = clock.hands_left()
+    # --- REGIME SWITCH ---
+    if USE_REGIME and hands_left > REGIME_K:
+        # chip-EV mid-game: fast, low-variance, has signal where P(1st) saturates.
+        ev_map = chip_ev(hand, my_seat, eq, opps)
+        # return in the same shape as P(1st) path so callers / loggers work uniformly.
+        # "pred_p1st" field repurposed as normalized EV (chips/100bb) for log compatibility.
+        results = []
+        bb = hand.bb
+        for (kind, amt) in cands:
+            ev = ev_map.get((kind, amt), 0.0)
+            # normalize to a 0..1ish range for logger; not a probability
+            pseudo = max(0.0, min(1.0, 0.5 + ev / (100 * bb)))
+            results.append((kind, amt, pseudo, eq))
+        best = max(results, key=lambda r: ev_map.get((r[0], r[1]), 0.0))
+        return best, eq, results
+    # --- ENDGAME: P(1st) rollout (existing behavior) ---
     results = []
     for (kind, amt) in cands:
         # my_added = chips this action puts in NOW (changes per raise size -> sizing matters)
@@ -539,9 +658,13 @@ def main():
                         print(f'  >>> ACTION: {kind.upper()} to {amt} total  (P1st {best[2]*100:.1f}%)')
                     else:
                         print(f'  >>> ACTION: {kind.upper()}  (P1st {best[2]*100:.1f}%)')
-                    input('    (press enter once done physically / u then enter to undo last): ') 
-                    # allow undo even on our own move
-                    # NOTE: handled below uniformly; here we just commit
+                    r = input('    (enter=done / u=undo): ').strip().lower()
+                    if r == 'u':
+                        if snaps:
+                            h2, s2, u2 = snaps.pop()
+                            hand = h2; seats[:] = s2; used.clear(); used.update(u2)
+                            print('    <- undone. re-enter from here.')
+                        continue
                     snap(); hand.apply(kind, amt)
                 else:
                     legal = hand.legal(seat)
@@ -549,6 +672,9 @@ def main():
                     print(f'\n  seat{seat+1} to act (to-call {tc}, pot {hand.pot}).')
                     print(f'    legal: {list(legal.keys())}   (u=undo last action)')
                     a = input('    action [fold/check/call/bet/raise]: ').strip().lower()
+                    if a == '':
+                        print('    ! empty input. type one of: fold/check/call/bet/raise (or u=undo)')
+                        continue
                     if a == 'u':
                         if snaps:
                             h2, s2, u2 = snaps.pop()

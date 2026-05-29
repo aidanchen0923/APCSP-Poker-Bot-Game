@@ -73,11 +73,27 @@ class SimClock:
     def hands_left(self): return self.hl
     def is_last(self): return self.hl <= 1
 class OurBot:
-    def __init__(self, n): self.models = [Seat() for _ in range(n)]
+    """wrapper. knobs are instance attrs so experiments can vary them per match.
+    eq_iters: inner equity MC iterations (live=18000, sim default=2500).
+    base_sims/last_sims: outer rollout sim count for regular/last hand.
+    log: if True, append per-decision data to self.decisions:
+       (street, n_opp, eq, chosen_kind, chosen_amt, predicted_p1st, all_results)"""
+    def __init__(self, n, eq_iters=2500, base_sims=200, last_sims=350, log=False):
+        self.models = [Seat() for _ in range(n)]
+        self.eq_iters = eq_iters; self.base_sims = base_sims; self.last_sims = last_sims
+        self.log = log; self.decisions = []
     def act(self, hand, seat, hole, board, clock, blinds, rng):
         pb.MY_HOLE = hole
-        best, eq, _ = decide(hand, seat, self.models, clock, blinds,
-                             eq_iters=2500, base_sims=200, last_sims=350)  # fast knobs for sim
+        best, eq, results = decide(hand, seat, self.models, clock, blinds,
+                                   eq_iters=self.eq_iters, base_sims=self.base_sims,
+                                   last_sims=self.last_sims)
+        if self.log:
+            n_opp = sum(1 for s in range(hand.n)
+                        if hand.live[s] and not hand.folded[s] and s != seat)
+            self.decisions.append(dict(
+                street=hand.street, n_opp=n_opp, eq=eq,
+                chosen_kind=best[0], chosen_amt=best[1], pred_p1st=best[2],
+                all_results=[(k, a, p) for (k, a, p, _) in results]))
         return best[0], best[1]
 
 # ---------------- headless match ----------------
@@ -183,33 +199,245 @@ def measure_priors(matches=200, n=6, seed=0):
           f"bluff={statistics.mean(bluff):.3f}, strength=20.0)")
     return statistics.mean(aggr), statistics.mean(fold), statistics.mean(bluff)
 
-def winrate(matches=60, n=6, seed=1, total_hands=12, mix=None):
-    """our 1st-place rate vs random zoo opponents. baseline random = 1/n."""
+def winrate(matches=60, n=6, seed=1, total_hands=12, mix=None,
+            start_stack=1000, blinds=(10,20,0,1.0),
+            eq_iters=2500, base_sims=200, last_sims=350,
+            progress_every=0, label=None, return_full=False):
+    """1st-place rate vs zoo. baseline random = 1/n.
+    mix: list of archetypes to fill non-our seats (uniform pick), else random zoo.
+    progress_every: print 1st-rate every N matches (0=silent).
+    returns dict(wr, ci_lo, ci_hi, avg_place, n, placings, by_archetype, last_rate)."""
+    import math
     rng = random.Random(seed); firsts = 0; placings = []
     types = list(ZOO)
+    by_arch_seen = {}; by_arch_their_first = {}
+    last_count = 0; last_first = 0
+    for m in range(matches):
+        our = rng.randrange(n)
+        opp_types = []
+        players = []
+        for i in range(n):
+            if i == our:
+                players.append(dict(type='OURS', bot=OurBot(n, eq_iters, base_sims, last_sims)))
+            else:
+                t = (mix[rng.randrange(len(mix))] if mix else rng.choice(types))
+                opp_types.append(t)
+                players.append(dict(type=t, policy=ZOO[t]))
+        final = play_match(players, start_stack, blinds, total_hands, rng, our_idx=our)
+        rank = sorted(range(n), key=lambda i: -final[i]).index(our) + 1
+        placings.append(rank)
+        if rank == 1: firsts += 1
+        for t in opp_types:
+            by_arch_seen[t] = by_arch_seen.get(t,0) + 1
+            if rank == 1: by_arch_their_first[t] = by_arch_their_first.get(t,0)
+        if rank == 1:
+            for t in set(opp_types):  # we beat at least one of this type
+                by_arch_their_first[t] = by_arch_their_first.get(t,0) + opp_types.count(t)
+        # last-quintile drift check
+        if m >= matches - max(10, matches//5):
+            last_count += 1; last_first += (rank == 1)
+        if progress_every and (m+1) % progress_every == 0:
+            print(f'  ...{m+1}/{matches} 1st-so-far {firsts/(m+1):.1%}', flush=True)
+    N = matches; wr = firsts/N
+    se = math.sqrt(wr*(1-wr)/N) if N>0 else 0
+    ci_lo, ci_hi = max(0,wr-1.96*se), min(1,wr+1.96*se)
+    last_rate = last_first/last_count if last_count else None
+    tag = f'[{label}] ' if label else ''
+    print(f'{tag}N={N} h={total_hands} seed={seed}: 1st {firsts}/{N} = {wr:.1%} '
+          f'CI[{ci_lo*100:.1f}%,{ci_hi*100:.1f}%] base {1/n:.1%}  avgplace {statistics.mean(placings):.2f}/{n}')
+    out = dict(wr=wr, ci_lo=ci_lo, ci_hi=ci_hi, avg_place=statistics.mean(placings),
+               n=N, firsts=firsts, last_rate=last_rate,
+               placings={k: placings.count(k) for k in range(1,n+1)})
+    if return_full:
+        out['raw_placings'] = placings
+        out['by_archetype_seen'] = by_arch_seen
+    return out
+
+def paired_ab(matches=200, n=6, base_seed=2025, total_hands=10,
+              eq_iters=2500, base_sims=200, last_sims=350, regime_K=2):
+    """DECISION 0 pre-registered test. paired A/B: same seed -> same deals, same opp picks,
+    same seat. only difference is USE_REGIME toggle. measure paired difference in 1st-rate.
+    pass iff 95% CI on diff EXCLUDES ZERO."""
+    import math, pokerbot as _pb
+    _pb.REGIME_K = regime_K
+    diffs = []       # +1 = new won and old lost, -1 = old won and new lost, 0 = same outcome
+    n_new = 0; n_old = 0
+    for m in range(matches):
+        seed = base_seed + m
+        # NEW bot: regime ON
+        _pb.USE_REGIME = True
+        rng = random.Random(seed); types = list(ZOO)
+        our = rng.randrange(n)
+        opp_types = []
+        for i in range(n):
+            if i != our:
+                opp_types.append(rng.choice(types))
+        # same opp draws will replay because we re-seed identically below
+        rng = random.Random(seed)
+        our_check = rng.randrange(n); assert our_check == our
+        players = []
+        oi = 0
+        for i in range(n):
+            if i == our:
+                players.append(dict(type='OURS', bot=OurBot(n, eq_iters, base_sims, last_sims)))
+            else:
+                t = rng.choice(types); players.append(dict(type=t, policy=ZOO[t]))
+        final_new = play_match(players, 1000, (10,20,0,1.0), total_hands,
+                               random.Random(seed*7919), our_idx=our)
+        rank_new = sorted(range(n), key=lambda i: -final_new[i]).index(our) + 1
+        won_new = (rank_new == 1)
+        # OLD bot: regime OFF, identical setup
+        _pb.USE_REGIME = False
+        rng = random.Random(seed)
+        our2 = rng.randrange(n); assert our2 == our
+        players = []
+        for i in range(n):
+            if i == our:
+                players.append(dict(type='OURS', bot=OurBot(n, eq_iters, base_sims, last_sims)))
+            else:
+                t = rng.choice(types); players.append(dict(type=t, policy=ZOO[t]))
+        final_old = play_match(players, 1000, (10,20,0,1.0), total_hands,
+                               random.Random(seed*7919), our_idx=our)
+        rank_old = sorted(range(n), key=lambda i: -final_old[i]).index(our) + 1
+        won_old = (rank_old == 1)
+        n_new += won_new; n_old += won_old
+        diffs.append(int(won_new) - int(won_old))
+        if (m+1) % 10 == 0:
+            cur_diff = sum(diffs)/len(diffs)
+            print(f'  ...{m+1}/{matches} new {n_new} vs old {n_old} (diff {cur_diff:+.3f})',
+                  flush=True)
+    # paired difference + 95% CI
+    mean_d = sum(diffs)/len(diffs)
+    var_d = sum((d - mean_d)**2 for d in diffs) / (len(diffs)-1) if len(diffs)>1 else 0
+    se = math.sqrt(var_d / len(diffs))
+    ci_lo, ci_hi = mean_d - 1.96*se, mean_d + 1.96*se
+    print(f'\n=== DECISION 0 RESULT ===')
+    print(f'N={matches} paired matches, regime_K={regime_K}')
+    print(f'NEW (chip-EV mid + P1st endgame): {n_new}/{matches} = {n_new/matches:.1%}')
+    print(f'OLD (P1st everywhere):            {n_old}/{matches} = {n_old/matches:.1%}')
+    print(f'Paired diff: {mean_d:+.3f}   95% CI [{ci_lo:+.3f}, {ci_hi:+.3f}]')
+    if ci_lo > 0:
+        print('PASS: CI excludes zero on the positive side. Adopt chip-EV mid-game.')
+    elif ci_hi < 0:
+        print('FAIL+: CI excludes zero on the negative side. Chip-EV mid-game is WORSE.')
+    else:
+        print('FAIL: CI includes zero. No measurable effect.')
+    return dict(n_new=n_new, n_old=n_old, mean_diff=mean_d, ci_lo=ci_lo, ci_hi=ci_hi)
+
+def raise_audit(seed=55, n=6, trials=4000):
+    """isolate WHY raises are overrated. sample the resolver directly across realistic
+    raise contexts and record folded-out vs called-won vs called-lost.
+    KEY: contexts are built so avg equity is ~0.5. if 'called & won' rate stays near 0.5
+    (or higher) instead of dropping, the resolver is using UNCONDITIONED equity at showdown
+    -- i.e. it ignores that callers hold stronger-than-random hands. that's the double-count."""
+    import pokerbot as _pb
+    rng = random.Random(seed)
+    _pb._RESOLVE_TRACE = []
+    eq_sum = 0.0
+    for _ in range(trials):
+        n_opp = rng.randint(1, 4)
+        opps = []
+        for _ in range(n_opp):
+            s = Seat()
+            for _ in range(rng.randint(0, 25)):
+                s.obs_action(rng.choice(['fold','call','raise','check']), rng.random()<0.5)
+            opps.append((rng.randrange(1, n), 0, s))
+        eq = rng.random(); eq_sum += eq
+        pot = rng.randint(40, 400)
+        my_added = rng.choice([pot//2, pot, pot*2])
+        st = [1000]*n
+        ctx = dict(pot=pot, my_added=my_added, my_fold=False, eq=eq, opps=opps)
+        _pb._resolve_current(st, 0, ctx, rng)
+    tr = _pb._RESOLVE_TRACE; _pb._RESOLVE_TRACE = None
+    fo = sum(1 for t,_ in tr if t=='folded_out')
+    cw = sum(1 for t,_ in tr if t=='called_won')
+    cl = sum(1 for t,_ in tr if t=='called_lost')
+    tot = max(1, fo+cw+cl); called = max(1, cw+cl)
+    print(f'\nRESOLVER raise outcomes over {tot} sampled raises (avg input eq {eq_sum/trials:.2f}):')
+    print(f'  folded out:    {fo/tot:.1%}')
+    print(f'  called & won:  {cw/tot:.1%}')
+    print(f'  called & lost: {cl/tot:.1%}')
+    print(f'  => when called, our win-rate = {cw/called:.1%}')
+    print(f'     if this ~= avg input eq (0.50), resolver treats callers as RANDOM hands.')
+    print(f'     real callers are stronger -> true called-win should be WELL BELOW 0.50.')
+    print(f'     gap between {cw/called:.1%} and reality = the raise overconfidence source.')
+    return dict(folded_out=fo/tot, called_winrate=cw/called)
+
+def calibration_run(matches=30, n=6, seed=99, total_hands=10, mix=None,
+                    eq_iters=2500, base_sims=200, last_sims=350):
+    """log every decision, group by predicted-P(1st) bucket, compare to actual outcome.
+    a well-calibrated rollout: bucket 'predicted 60%' should win ~60% of the time.
+    persistent over-prediction in a bucket = the rollout lies about that action class."""
+    rng = random.Random(seed); types = list(ZOO)
+    all_decisions = []
+    firsts = 0
     for m in range(matches):
         our = rng.randrange(n)
         players = []
         for i in range(n):
-            if i == our: players.append(dict(type='OURS', bot=OurBot(n)))
+            if i == our:
+                players.append(dict(type='OURS',
+                    bot=OurBot(n, eq_iters, base_sims, last_sims, log=True)))
             else:
                 t = (mix[rng.randrange(len(mix))] if mix else rng.choice(types))
                 players.append(dict(type=t, policy=ZOO[t]))
         final = play_match(players, 1000, (10,20,0,1.0), total_hands, rng, our_idx=our)
         rank = sorted(range(n), key=lambda i: -final[i]).index(our) + 1
-        placings.append(rank)
-        if rank == 1: firsts += 1
-    print(f'\nour 1st-place rate: {firsts}/{matches} = {firsts/matches:.1%}  (random baseline {1/n:.1%})')
-    print(f'avg placing: {statistics.mean(placings):.2f} / {n}   (lower better)')
-    return firsts/matches
+        won = (rank == 1)
+        if won: firsts += 1
+        for d in players[our]['bot'].decisions:
+            all_decisions.append((d, won))
+    print(f'\nN={matches} matches, {len(all_decisions)} decisions, 1st-rate {firsts/matches:.1%}')
+    buckets = [(0,.15),(.15,.30),(.30,.45),(.45,.60),(.60,.80),(.80,1.01)]
+    print('\n  predicted -> actual win-rate (bucket count). gap = pred - actual')
+    for lo, hi in buckets:
+        in_b = [(d, w) for d, w in all_decisions if lo <= d['pred_p1st'] < hi]
+        if not in_b: continue
+        avg_pred = sum(d['pred_p1st'] for d, _ in in_b)/len(in_b)
+        actual = sum(1 for _, w in in_b if w)/len(in_b)
+        gap = avg_pred - actual
+        flag = ' OVERCONFIDENT' if gap > 0.10 else (' underconfident' if gap < -0.10 else '')
+        print(f'  [{lo:.2f},{hi:.2f}) pred {avg_pred:.2f} actual {actual:.2f} gap {gap:+.2f} n={len(in_b)}{flag}')
+    print('\n  by chosen action:')
+    for kind in ['fold','check','call','bet','raise']:
+        sub = [(d, w) for d, w in all_decisions if d['chosen_kind'] == kind]
+        if not sub: continue
+        avg_pred = sum(d['pred_p1st'] for d, _ in sub)/len(sub)
+        actual = sum(1 for _, w in sub if w)/len(sub)
+        print(f'  {kind:6s} pred {avg_pred:.2f} actual {actual:.2f} n={len(sub)} gap {avg_pred-actual:+.2f}')
+    print('\n  by street:')
+    for st_name, st in [('preflop',0),('flop',1),('turn',2),('river',3)]:
+        sub = [(d, w) for d, w in all_decisions if d['street'] == st]
+        if not sub: continue
+        avg_pred = sum(d['pred_p1st'] for d, _ in sub)/len(sub)
+        actual = sum(1 for _, w in sub if w)/len(sub)
+        print(f'  {st_name:8s} pred {avg_pred:.2f} actual {actual:.2f} n={len(sub)} gap {avg_pred-actual:+.2f}')
+    return all_decisions
+
+def confirm(matches=120, n=6, seeds=(42,137), total_hands=10, **kw):
+    """run N matches split across seeds, combine. the experiment from last round."""
+    import math
+    per = matches // len(seeds)
+    all_pl = []; firsts_total = 0
+    for s in seeds:
+        r = winrate(matches=per, n=n, seed=s, total_hands=total_hands,
+                    progress_every=10, label=f'seed{s}', return_full=True, **kw)
+        firsts_total += r['firsts']; all_pl += r['raw_placings']
+    N = len(all_pl); wr = firsts_total/N
+    se = math.sqrt(wr*(1-wr)/N)
+    print(f'\nCOMBINED N={N} h={total_hands}: 1st {firsts_total}/{N} = {wr:.1%} '
+          f'CI[{(wr-1.96*se)*100:.1f}%,{(wr+1.96*se)*100:.1f}%]  base {1/n:.1%}')
+    print('placings:', {k: all_pl.count(k) for k in range(1,n+1)})
+    return dict(wr=wr, ci_lo=wr-1.96*se, ci_hi=wr+1.96*se, n=N)
 
 if __name__ == '__main__':
-    print('=== ENGINE + STRATEGY TEST HARNESS ===')
-    print('[1] measuring population priors from zoo (also exercises engine + chip conservation)...')
-    measure_priors(matches=120)
-    print('\n[2] our 1st-place rate vs full random zoo...')
-    winrate(matches=40)
-    print('\n[3] vs all-maniac table (exploit check: should crush)...')
-    winrate(matches=30, mix=['maniac'])
-    print('\n[4] vs all-nit table (steal check)...')
-    winrate(matches=30, mix=['nit'])
+    # light smoke test - confirms engine + priors + bot wire up. ~30-60s.
+    # for real experiments, write a driver script that imports sim and calls
+    # measure_priors / winrate / confirm with the knobs you want.
+    print('=== sim smoke test ===')
+    print('[1] priors (engine + chip conservation, small sample):')
+    measure_priors(matches=40)
+    print('\n[2] winrate quick sanity (N=15, horizon 10):')
+    winrate(matches=15, total_hands=10, seed=0, label='smoke')
+    print('\nfor real runs, see drivers/ or write your own:')
+    print('  import sim; sim.confirm(matches=120, total_hands=10)')
